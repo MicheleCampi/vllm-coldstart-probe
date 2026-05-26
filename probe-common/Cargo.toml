@@ -1,0 +1,18 @@
+[package]
+name = "probe-common"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+user = ["aya"]
+
+[dependencies]
+aya = { version = "0.13.1", optional = true }
+
+[lints]
+workspace = true

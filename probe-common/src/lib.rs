@@ -1,0 +1,32 @@
+#![no_std]
+
+/// Event emitted from the eBPF probe when a tracked syscall enters or exits.
+///
+/// This struct crosses the kernel/user boundary via a ring buffer, so its
+/// layout must be stable (`repr(C)`) and contain only POD fields.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct SyscallEvent {
+    /// Monotonic nanosecond timestamp from `bpf_ktime_get_ns()`.
+    pub timestamp_ns: u64,
+    /// PID of the process that invoked the syscall.
+    pub pid: u32,
+    /// TID of the thread that invoked the syscall.
+    pub tid: u32,
+    /// Syscall number (architecture-specific, x86_64 here).
+    pub syscall_nr: u32,
+    /// Event kind: 0 = enter, 1 = exit.
+    pub kind: u8,
+    /// Padding to align the struct to 8 bytes.
+    _pad: [u8; 3],
+    /// Return value on exit (raw `i64` from kernel), 0 on enter.
+    pub ret: i64,
+}
+
+impl SyscallEvent {
+    pub const KIND_ENTER: u8 = 0;
+    pub const KIND_EXIT: u8 = 1;
+}
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for SyscallEvent {}

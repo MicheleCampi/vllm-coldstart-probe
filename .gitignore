@@ -1,0 +1,12 @@
+# Build artifacts
+/target/
+/probe-ebpf/target/
+**/*.rs.bk
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
