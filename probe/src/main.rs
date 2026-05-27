@@ -169,6 +169,20 @@ async fn main() -> Result<()> {
             .context("failed to attach to syscalls:sys_enter_openat")?;
     }
 
+    {
+        let program: &mut TracePoint = ebpf
+            .program_mut("probe_sys_exit_openat")
+            .context("program `probe_sys_exit_openat` not found in ELF")?
+            .try_into()
+            .context("program is not a TracePoint")?;
+        program
+            .load()
+            .context("failed to load tracepoint into kernel (verifier rejected?)")?;
+        program
+            .attach("syscalls", "sys_exit_openat")
+            .context("failed to attach to syscalls:sys_exit_openat")?;
+    }
+
     let events: RingBuf<_> = ebpf
         .take_map("EVENTS")
         .context("ring buffer map `EVENTS` not found in ELF")?
@@ -177,7 +191,7 @@ async fn main() -> Result<()> {
 
     let mut writer = build_writer(cli.output.as_deref())?;
 
-    info!("probe attached to syscalls:sys_enter_openat — userspace-filtering for pid={}", cli.pid);
+    info!("probe attached to syscalls:sys_enter_openat + sys_exit_openat, userspace-filtering for pid={}", cli.pid);
 
     let (tx, mut rx) = mpsc::channel::<SyscallEvent>(CHANNEL_CAPACITY);
     let drainer = tokio::task::spawn_blocking(move || drain_ring_buffer(events, tx));

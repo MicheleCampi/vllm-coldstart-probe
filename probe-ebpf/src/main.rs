@@ -1,8 +1,8 @@
 //! vLLM cold-start eBPF probe — kernel-side program.
 //!
-//! Attaches to syscall tracepoints and uprobes, emits `SyscallEvent` records
-//! to a ring buffer consumed by the user-space loader. PID filtering is
-//! currently performed in userspace; see the design note below.
+//! Attaches to syscall tracepoints (enter+exit pairs) and emits a
+//! `SyscallEvent` per side, allowing userspace to compute syscall duration
+//! by matching enter/exit records on (pid, tid, syscall_nr) tuples.
 //!
 //! # PID filtering design note
 //!
@@ -12,7 +12,7 @@
 //! `pub static mut` and `unsafe { &mut MAP }.get(...)` wrappers matching
 //! the pattern used by aya-log. The lookup helper call was emitted but
 //! the linker dropped both the map and the helper invocation. Userspace
-//! filtering is the pragmatic alternative: every `openat` from every
+//! filtering is the pragmatic alternative: every syscall from every
 //! process reaches userspace via the ring buffer, and the consumer
 //! discards events whose PID does not match the target. Overhead is
 //! tolerable for cold-start capture on an otherwise-idle machine.
@@ -40,9 +40,15 @@ static EVENTS: RingBuf = RingBuf::with_byte_size(1 << 18, 0);
 /// architecture dispatch when we expand beyond x86_64.
 const SYS_OPENAT: u32 = 257;
 
-/// Tracepoint on `sys_enter_openat`. Emits one `SyscallEvent` per invocation
+/// Byte offset of the `ret` field within the `sys_exit_*` tracepoint
+/// context on x86_64. The layout is: 8 bytes common header + 8 bytes
+/// syscall_nr (long), then the i64 return value. Confirmed against
+/// /sys/kernel/tracing/events/syscalls/sys_exit_openat/format.
+const SYS_EXIT_RET_OFFSET: usize = 16;
+
+/// Tracepoint on `sys_enter_openat`. Emits one ENTER event per invocation
 /// for every process; userspace filters by PID.
-#[tracepoint]
+#[tracepoint(name = "sys_enter_openat", category = "syscalls")]
 pub fn probe_sys_enter_openat(_ctx: TracePointContext) -> u32 {
     let pid_tgid = bpf_get_current_pid_tgid();
     let pid = (pid_tgid >> 32) as u32;
@@ -54,6 +60,35 @@ pub fn probe_sys_enter_openat(_ctx: TracePointContext) -> u32 {
     };
 
     let event = SyscallEvent::new_enter(timestamp_ns, pid, tid, SYS_OPENAT);
+    unsafe {
+        core::ptr::write(entry.as_mut_ptr(), event);
+    }
+    entry.submit(0);
+
+    0
+}
+
+/// Tracepoint on `sys_exit_openat`. Emits one EXIT event per invocation,
+/// carrying the syscall return value (positive = fd, negative = -errno).
+/// Userspace pairs ENTER and EXIT by (pid, tid, syscall_nr) and computes
+/// duration = exit.timestamp_ns - enter.timestamp_ns.
+#[tracepoint(name = "sys_exit_openat", category = "syscalls")]
+pub fn probe_sys_exit_openat(ctx: TracePointContext) -> u32 {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let pid = (pid_tgid >> 32) as u32;
+    let tid = pid_tgid as u32;
+    let timestamp_ns = unsafe { bpf_ktime_get_ns() };
+
+    // Read the ret value from the tracepoint context. If the read fails
+    // (out-of-bounds or other verifier rejection), default to 0; userspace
+    // will see a zero ret on exit and can flag it as suspicious if needed.
+    let ret: i64 = unsafe { ctx.read_at::<i64>(SYS_EXIT_RET_OFFSET) }.unwrap_or(0);
+
+    let Some(mut entry) = EVENTS.reserve::<SyscallEvent>(0) else {
+        return 0;
+    };
+
+    let event = SyscallEvent::new_exit(timestamp_ns, pid, tid, SYS_OPENAT, ret);
     unsafe {
         core::ptr::write(entry.as_mut_ptr(), event);
     }
