@@ -3,10 +3,11 @@ resolver = "2"
 members = [
     "probe-common",
     "probe",
-
-]
-exclude = [
     "probe-ebpf",
+]
+default-members = [
+    "probe-common",
+    "probe",
 ]
 
 [workspace.package]
@@ -25,3 +26,19 @@ missing_debug_implementations = "warn"
 pedantic = { level = "warn", priority = -1 }
 module_name_repetitions = "allow"
 missing_errors_doc = "allow"
+
+# eBPF programs require maximum optimization and abort-on-panic regardless
+# of profile, because the kernel verifier rejects unoptimized bytecode and
+# eBPF does not support unwinding. These profile overrides apply to the
+# `probe-ebpf` package specifically. Userspace crates (`probe`, `probe-common`)
+# use cargo defaults.
+[profile.dev.package.probe-ebpf]
+opt-level = 3
+debug = false
+debug-assertions = false
+overflow-checks = false
+codegen-units = 1
+
+[profile.release.package.probe-ebpf]
+debug = false
+codegen-units = 1

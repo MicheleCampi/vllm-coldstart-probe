@@ -26,6 +26,40 @@ pub struct SyscallEvent {
 impl SyscallEvent {
     pub const KIND_ENTER: u8 = 0;
     pub const KIND_EXIT: u8 = 1;
+
+    /// Construct an enter event. `ret` is always zero for enter events.
+    #[must_use]
+    pub const fn new_enter(timestamp_ns: u64, pid: u32, tid: u32, syscall_nr: u32) -> Self {
+        Self {
+            timestamp_ns,
+            pid,
+            tid,
+            syscall_nr,
+            kind: Self::KIND_ENTER,
+            _pad: [0; 3],
+            ret: 0,
+        }
+    }
+
+    /// Construct an exit event with the syscall return value.
+    #[must_use]
+    pub const fn new_exit(
+        timestamp_ns: u64,
+        pid: u32,
+        tid: u32,
+        syscall_nr: u32,
+        ret: i64,
+    ) -> Self {
+        Self {
+            timestamp_ns,
+            pid,
+            tid,
+            syscall_nr,
+            kind: Self::KIND_EXIT,
+            _pad: [0; 3],
+            ret,
+        }
+    }
 }
 
 #[cfg(feature = "user")]
