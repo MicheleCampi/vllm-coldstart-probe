@@ -1,11 +1,15 @@
 #![no_std]
 
+#[cfg(feature = "user")]
+use serde::Serialize;
+
 /// Event emitted from the eBPF probe when a tracked syscall enters or exits.
 ///
 /// This struct crosses the kernel/user boundary via a ring buffer, so its
 /// layout must be stable (`repr(C)`) and contain only POD fields.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "user", derive(Serialize))]
 pub struct SyscallEvent {
     /// Monotonic nanosecond timestamp from `bpf_ktime_get_ns()`.
     pub timestamp_ns: u64,
@@ -17,7 +21,9 @@ pub struct SyscallEvent {
     pub syscall_nr: u32,
     /// Event kind: 0 = enter, 1 = exit.
     pub kind: u8,
-    /// Padding to align the struct to 8 bytes.
+    /// Padding to align the struct to 8 bytes. Not part of the public event
+    /// schema, so it is skipped during serialization.
+    #[cfg_attr(feature = "user", serde(skip))]
     _pad: [u8; 3],
     /// Return value on exit (raw `i64` from kernel), 0 on enter.
     pub ret: i64,

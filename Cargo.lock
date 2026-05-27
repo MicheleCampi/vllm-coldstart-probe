@@ -556,6 +556,7 @@ dependencies = [
  "env_logger",
  "log",
  "probe-common",
+ "serde_json",
  "tokio",
 ]
 
@@ -564,6 +565,7 @@ name = "probe-common"
 version = "0.1.0"
 dependencies = [
  "aya",
+ "serde",
 ]
 
 [[package]]
