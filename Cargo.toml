@@ -33,7 +33,7 @@ missing_errors_doc = "allow"
 # `probe-ebpf` package specifically. Userspace crates (`probe`, `probe-common`)
 # use cargo defaults.
 [profile.dev.package.probe-ebpf]
-opt-level = 3
+opt-level = 2
 debug = false
 debug-assertions = false
 overflow-checks = false

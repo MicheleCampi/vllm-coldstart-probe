@@ -177,7 +177,7 @@ async fn main() -> Result<()> {
 
     let mut writer = build_writer(cli.output.as_deref())?;
 
-    info!("probe attached to syscalls:sys_enter_openat — capturing events");
+    info!("probe attached to syscalls:sys_enter_openat — userspace-filtering for pid={}", cli.pid);
 
     let (tx, mut rx) = mpsc::channel::<SyscallEvent>(CHANNEL_CAPACITY);
     let drainer = tokio::task::spawn_blocking(move || drain_ring_buffer(events, tx));
@@ -199,6 +199,9 @@ async fn main() -> Result<()> {
             event = rx.recv() => {
                 match event {
                     Some(ev) => {
+                        if ev.pid != cli.pid {
+                            continue;
+                        }
                         consumed += 1;
                         match serde_json::to_writer(&mut writer, &ev) {
                             Ok(()) => {
