@@ -9,6 +9,7 @@ publish = false
 aya-ebpf = "0.1.1"
 aya-log-ebpf = "0.1.0"
 probe-common = { path = "../probe-common" }
+paste = "1.0"
 
 [[bin]]
 name = "probe"

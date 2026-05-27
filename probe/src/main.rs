@@ -1,9 +1,10 @@
 //! vLLM cold-start eBPF probe — user-space loader and CLI.
 //!
-//! Loads the eBPF program embedded at build time, attaches it to the
-//! `sys_enter_openat` tracepoint, drains events from the ring buffer
-//! on a dedicated blocking thread, and writes them as JSON Lines to
-//! stdout (default) or a file (via `--output`).
+//! Loads the eBPF program embedded at build time, attaches enter+exit
+//! tracepoints for the cold-start-relevant syscalls (openat, read, mmap,
+//! close), drains events from the ring buffer on a dedicated blocking
+//! thread, filters by PID in userspace, and writes JSONL to stdout
+//! (default) or a file (via `--output`).
 
 use std::{
     fs::File,
@@ -33,27 +34,21 @@ static PROBE_OBJECT: &AlignedBytes<[u8]> = &AlignedBytes(*include_bytes!(concat!
     "/probe"
 )));
 
-/// Channel capacity between the polling thread and the main task.
-/// Large enough to absorb short bursts; the polling thread drops events
-/// (with a warn log) if the consumer can't keep up.
 const CHANNEL_CAPACITY: usize = 4096;
-
-/// Polling interval when the ring buffer is empty. Tuning trade-off:
-/// shorter = lower latency, more CPU; longer = batchier reads.
-/// 1ms is a good default for cold-start capture (sub-millisecond latency
-/// is irrelevant when the phenomenon being measured spans seconds).
 const POLL_INTERVAL: Duration = Duration::from_millis(1);
-
-/// Flush the output writer every N events. Trade-off: more flushes means
-/// less data lost on crash, more syscalls; fewer means better throughput,
-/// more in-flight data at risk.
 const FLUSH_EVERY: u64 = 1000;
+
+/// Syscalls we attach to during cold-start capture. Each entry produces
+/// two kernel programs: `probe_sys_enter_<short>` and `probe_sys_exit_<short>`,
+/// attached to `syscalls/sys_enter_<short>` and `syscalls/sys_exit_<short>`
+/// tracepoints respectively. Short names must match the macro invocations
+/// in `probe-ebpf/src/main.rs`.
+const TRACED_SYSCALLS: &[&str] = &["openat", "read", "mmap", "close"];
 
 #[derive(Parser, Debug)]
 #[command(version, about = "vLLM cold-start eBPF probe", long_about = None)]
 struct Cli {
     /// PID of the process to trace (typically the vLLM worker).
-    /// Currently informational only — kernel-side does not filter yet.
     #[arg(long)]
     pid: u32,
 
@@ -66,8 +61,30 @@ struct Cli {
     output: Option<std::path::PathBuf>,
 }
 
-/// Drains the ring buffer on a blocking thread, forwarding events to the
-/// async consumer via `tx`. Returns when `tx` is closed (consumer dropped).
+/// Load + attach a single tracepoint by Rust function name and kernel hook.
+///
+/// Borrows `ebpf` mutably only for the duration of this call, so the next
+/// attach can run cleanly without scope juggling at the call site.
+fn attach_tracepoint(
+    ebpf: &mut Ebpf,
+    rust_fn_name: &str,
+    category: &str,
+    event: &str,
+) -> Result<()> {
+    let program: &mut TracePoint = ebpf
+        .program_mut(rust_fn_name)
+        .with_context(|| format!("program `{rust_fn_name}` not found in ELF"))?
+        .try_into()
+        .with_context(|| format!("program `{rust_fn_name}` is not a TracePoint"))?;
+    program
+        .load()
+        .with_context(|| format!("failed to load tracepoint `{rust_fn_name}` into kernel"))?;
+    program
+        .attach(category, event)
+        .with_context(|| format!("failed to attach `{rust_fn_name}` to {category}:{event}"))?;
+    Ok(())
+}
+
 fn drain_ring_buffer(
     mut events: RingBuf<aya::maps::MapData>,
     tx: mpsc::Sender<SyscallEvent>,
@@ -86,10 +103,8 @@ fn drain_ring_buffer(
                 );
                 continue;
             }
-            // SAFETY: `SyscallEvent` is `#[repr(C)]`, `Copy`, and contains
-            // only POD fields. The ring buffer entry was written by our own
-            // eBPF program with the same struct definition (via the shared
-            // `probe-common` crate), so the bytes are a valid `SyscallEvent`.
+            // SAFETY: SyscallEvent is repr(C), Copy, POD; written by our
+            // own kernel-side program via the shared probe-common crate.
             let event: SyscallEvent = unsafe {
                 std::ptr::read_unaligned(item.as_ptr().cast::<SyscallEvent>())
             };
@@ -121,9 +136,6 @@ fn drain_ring_buffer(
     }
 }
 
-/// Construct the JSONL output writer: stdout when `output` is `None`,
-/// otherwise a buffered file writer. The returned writer is sent across
-/// thread boundaries so it must be `Send`.
 fn build_writer(output: Option<&std::path::Path>) -> Result<Box<dyn Write + Send>> {
     match output {
         None => Ok(Box::new(BufWriter::new(std::io::stdout()))),
@@ -155,32 +167,20 @@ async fn main() -> Result<()> {
         warn!("aya-log init failed (continuing without kernel logs): {err}");
     }
 
-    {
-        let program: &mut TracePoint = ebpf
-            .program_mut("probe_sys_enter_openat")
-            .context("program `probe_sys_enter_openat` not found in ELF")?
-            .try_into()
-            .context("program is not a TracePoint")?;
-        program
-            .load()
-            .context("failed to load tracepoint into kernel (verifier rejected?)")?;
-        program
-            .attach("syscalls", "sys_enter_openat")
-            .context("failed to attach to syscalls:sys_enter_openat")?;
-    }
-
-    {
-        let program: &mut TracePoint = ebpf
-            .program_mut("probe_sys_exit_openat")
-            .context("program `probe_sys_exit_openat` not found in ELF")?
-            .try_into()
-            .context("program is not a TracePoint")?;
-        program
-            .load()
-            .context("failed to load tracepoint into kernel (verifier rejected?)")?;
-        program
-            .attach("syscalls", "sys_exit_openat")
-            .context("failed to attach to syscalls:sys_exit_openat")?;
+    // Attach enter+exit pair for every syscall in TRACED_SYSCALLS.
+    for syscall in TRACED_SYSCALLS {
+        attach_tracepoint(
+            &mut ebpf,
+            &format!("probe_sys_enter_{syscall}"),
+            "syscalls",
+            &format!("sys_enter_{syscall}"),
+        )?;
+        attach_tracepoint(
+            &mut ebpf,
+            &format!("probe_sys_exit_{syscall}"),
+            "syscalls",
+            &format!("sys_exit_{syscall}"),
+        )?;
     }
 
     let events: RingBuf<_> = ebpf
@@ -191,7 +191,12 @@ async fn main() -> Result<()> {
 
     let mut writer = build_writer(cli.output.as_deref())?;
 
-    info!("probe attached to syscalls:sys_enter_openat + sys_exit_openat, userspace-filtering for pid={}", cli.pid);
+    info!(
+        "probe attached to {} syscalls ({} tracepoints), userspace-filtering for pid={}",
+        TRACED_SYSCALLS.len(),
+        TRACED_SYSCALLS.len() * 2,
+        cli.pid
+    );
 
     let (tx, mut rx) = mpsc::channel::<SyscallEvent>(CHANNEL_CAPACITY);
     let drainer = tokio::task::spawn_blocking(move || drain_ring_buffer(events, tx));
