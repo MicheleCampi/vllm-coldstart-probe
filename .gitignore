@@ -10,3 +10,6 @@
 
 # OS
 .DS_Store
+
+# Capture data (re-runnable via the probe + analysis scripts)
+data/

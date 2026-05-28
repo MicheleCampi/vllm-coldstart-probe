@@ -1,0 +1,7 @@
+# Cargo configuration for the workspace.
+#
+# Note: `probe-ebpf/.cargo/config.toml` overrides this for builds inside
+# that crate (BPF target). This file only affects userspace targets.
+
+[target.x86_64-unknown-linux-musl]
+linker = "musl-gcc"
