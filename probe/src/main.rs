@@ -272,7 +272,10 @@ async fn main() -> Result<()> {
             event = rx.recv() => {
                 match event {
                     Some(ev) => {
-                        if ev.pid != cli.pid {
+                        // pid 0 means "capture every process" — used when the
+                        // target spawns subprocesses (e.g. vLLM EngineCore)
+                        // whose PIDs are not known until after attach.
+                        if cli.pid != 0 && ev.pid != cli.pid {
                             continue;
                         }
                         consumed += 1;
