@@ -1,9 +1,12 @@
 //! vLLM cold-start eBPF probe — kernel-side program.
 //!
 //! Attaches enter+exit tracepoint pairs for the syscalls relevant to
-//! model-load cold-start: openat, read, mmap, close. Each pair emits a
-//! `SyscallEvent` per side; userspace pairs them on (pid, tid, syscall_nr)
-//! and computes per-syscall duration.
+//! model-load cold-start (openat, read, mmap, close) and uprobes on
+//! userspace library functions (currently the libcuda C API) to attribute
+//! the large userspace/GPU portion of cold-start that syscalls cannot see.
+//! Every probe emits a `SyscallEvent`; userspace pairs syscall enter/exit
+//! on (pid, tid, syscall_nr) and treats uprobe events (id >= 1000) as
+//! one-sided phase markers.
 //!
 //! # PID filtering design note
 //!
@@ -13,10 +16,10 @@
 //! `pub static mut` and `unsafe { &mut MAP }.get(...)` wrappers matching
 //! the pattern used by aya-log. The lookup helper call was emitted but
 //! the linker dropped both the map and the helper invocation. Userspace
-//! filtering is the pragmatic alternative: every syscall from every
-//! process reaches userspace via the ring buffer, and the consumer
-//! discards events whose PID does not match the target. Overhead is
-//! tolerable for cold-start capture on an otherwise-idle machine.
+//! filtering is the pragmatic alternative: every event from every process
+//! reaches userspace via the ring buffer, and the consumer discards
+//! events whose PID does not match the target. Overhead is tolerable for
+//! cold-start capture on an otherwise-idle machine.
 
 #![no_std]
 #![no_main]
@@ -42,35 +45,6 @@ static EVENTS: RingBuf = RingBuf::with_byte_size(1 << 18, 0);
 /// syscall_nr (long), then the i64 return value. Confirmed against
 /// /sys/kernel/tracing/events/syscalls/sys_exit_<any>/format.
 const SYS_EXIT_RET_OFFSET: usize = 16;
-
-/// Generates a paired enter/exit tracepoint for a given syscall.
-///
-/// Expansion produces two `#[tracepoint]` functions whose names are
-/// `probe_sys_enter_<short>` and `probe_sys_exit_<short>`, attached to
-/// the kernel tracepoints `syscalls/sys_enter_<short>` and
-/// `syscalls/sys_exit_<short>` respectively. Both write to the shared
-/// `EVENTS` ring buffer.
-///
-/// The explicit `name = ...` and `category = "syscalls"` arguments are
-/// load-bearing: without them the `#[tracepoint]` macro generates the
-/// generic `link_section = "tracepoint"` for both functions, and the
-/// linker silently drops the second one because they collide in the
-/// same section.
-macro_rules! define_syscall_tracepoint {
-    ($short:ident, $syscall_nr:expr) => {
-        ::paste::paste! {
-            #[tracepoint(name = "" "sys_enter_" $short "", category = "syscalls")]
-            pub fn [<probe_sys_enter_ $short>](_ctx: TracePointContext) -> u32 {
-                emit_enter($syscall_nr)
-            }
-
-            #[tracepoint(name = "" "sys_exit_" $short "", category = "syscalls")]
-            pub fn [<probe_sys_exit_ $short>](ctx: TracePointContext) -> u32 {
-                emit_exit(ctx, $syscall_nr)
-            }
-        }
-    };
-}
 
 /// Shared emit logic for ENTER events. Inlined so each tracepoint stays
 /// a single compact eBPF program the verifier can check quickly.
@@ -118,6 +92,29 @@ fn emit_exit(ctx: TracePointContext, syscall_nr: u32) -> u32 {
     0
 }
 
+/// Generates a paired enter/exit tracepoint for a given syscall.
+///
+/// The explicit `name = ...` and `category = "syscalls"` arguments are
+/// load-bearing: without them the `#[tracepoint]` macro generates the
+/// generic `link_section = "tracepoint"` for both functions, and the
+/// linker silently drops the second one because they collide in the
+/// same section.
+macro_rules! define_syscall_tracepoint {
+    ($short:ident, $syscall_nr:expr) => {
+        ::paste::paste! {
+            #[tracepoint(name = "" "sys_enter_" $short "", category = "syscalls")]
+            pub fn [<probe_sys_enter_ $short>](_ctx: TracePointContext) -> u32 {
+                emit_enter($syscall_nr)
+            }
+
+            #[tracepoint(name = "" "sys_exit_" $short "", category = "syscalls")]
+            pub fn [<probe_sys_exit_ $short>](ctx: TracePointContext) -> u32 {
+                emit_exit(ctx, $syscall_nr)
+            }
+        }
+    };
+}
+
 // x86_64 syscall numbers. Source: arch/x86/entry/syscalls/syscall_64.tbl
 // in the Linux kernel source. Hardcoded for now; build-time arch dispatch
 // when we expand beyond x86_64.
@@ -132,14 +129,16 @@ define_syscall_tracepoint!(close, 3);
 // (which use the real syscall number, all < 1000) in the shared
 // SyscallEvent stream. The userspace analysis splits on this boundary.
 //
-// This first uprobe targets libc malloc purely to validate the uprobe
-// mechanism end-to-end on the dev VM, where no GPU / libcuda exists.
-// It will be replaced by libcuda C-API probes (cuInit, cuModuleLoad,
-// cuMemAlloc, ...) once the attach + event path is proven.
-const EVENT_ID_MALLOC: u32 = 1000;
+// Each uprobe fires on ENTER of a userspace library function. We do not
+// capture the return side: a uretprobe needs a separate program type, and
+// the entry timing alone already marks when each phase of cold-start
+// begins. Duration between consecutive markers is recoverable in analysis
+// from the timestamps.
 
-#[uprobe]
-pub fn probe_malloc(_ctx: ProbeContext) -> u32 {
+/// Shared emit logic for uprobe ENTER events. Inlined so each generated
+/// uprobe stays a single compact eBPF program.
+#[inline(always)]
+fn emit_uprobe(event_id: u32) -> u32 {
     let pid_tgid = bpf_get_current_pid_tgid();
     let pid = (pid_tgid >> 32) as u32;
     let tid = pid_tgid as u32;
@@ -149,7 +148,7 @@ pub fn probe_malloc(_ctx: ProbeContext) -> u32 {
         return 0;
     };
 
-    let event = SyscallEvent::new_enter(timestamp_ns, pid, tid, EVENT_ID_MALLOC);
+    let event = SyscallEvent::new_enter(timestamp_ns, pid, tid, event_id);
     unsafe {
         core::ptr::write(entry.as_mut_ptr(), event);
     }
@@ -157,6 +156,29 @@ pub fn probe_malloc(_ctx: ProbeContext) -> u32 {
 
     0
 }
+
+/// Generates an `#[uprobe]` function named `probe_<short>` that emits an
+/// event tagged with `event_id`. The userspace side attaches it to a
+/// concrete symbol + library; the kernel side only needs the event id.
+macro_rules! define_uprobe {
+    ($short:ident, $event_id:expr) => {
+        ::paste::paste! {
+            #[uprobe]
+            pub fn [<probe_ $short>](_ctx: ProbeContext) -> u32 {
+                emit_uprobe($event_id)
+            }
+        }
+    };
+}
+
+// libcuda C-API entry points relevant to cold-start. Event ids are local
+// to this tool (>= 1000) and must match the event-id name map in
+// analysis/analyze.py. The userspace side (TRACED_UPROBES) maps each Rust
+// function name to the concrete symbol and library to attach to.
+define_uprobe!(cu_init, 1000);
+define_uprobe!(cu_module_load_data, 1001);
+define_uprobe!(cu_mem_alloc, 1002);
+define_uprobe!(cu_launch_kernel, 1003);
 
 #[cfg(not(test))]
 #[panic_handler]

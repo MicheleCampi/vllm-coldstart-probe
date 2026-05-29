@@ -45,6 +45,26 @@ const FLUSH_EVERY: u64 = 1000;
 /// in `probe-ebpf/src/main.rs`.
 const TRACED_SYSCALLS: &[&str] = &["openat", "read", "mmap", "close"];
 
+/// Absolute path to the CUDA driver library on the capture host. This is
+/// the standard location on Lambda Labs / Ubuntu GPU images; adjust if the
+/// target places it elsewhere (check with ldconfig -p and grep libcuda).
+const LIBCUDA_PATH: &str = "/usr/lib/x86_64-linux-gnu/libcuda.so.1";
+
+/// Uprobe targets: (rust_fn_name, symbol, library). The rust_fn_name must
+/// match a define_uprobe!-generated function in probe-ebpf; the symbol is
+/// the exported function in the library; the library is resolved by aya
+/// either by name (e.g. "libc") or absolute path. libcuda is given by
+/// absolute path because it is not on the default linker search path.
+///
+/// The _v2 suffix on cuMemAlloc is the real exported symbol name in the
+/// CUDA driver ABI; the unsuffixed cuMemAlloc is a macro in the headers.
+const TRACED_UPROBES: &[(&str, &str, &str)] = &[
+    ("probe_cu_init", "cuInit", LIBCUDA_PATH),
+    ("probe_cu_module_load_data", "cuModuleLoadData", LIBCUDA_PATH),
+    ("probe_cu_mem_alloc", "cuMemAlloc_v2", LIBCUDA_PATH),
+    ("probe_cu_launch_kernel", "cuLaunchKernel", LIBCUDA_PATH),
+];
+
 #[derive(Parser, Debug)]
 #[command(version, about = "vLLM cold-start eBPF probe", long_about = None)]
 struct Cli {
@@ -82,6 +102,30 @@ fn attach_tracepoint(
     program
         .attach(category, event)
         .with_context(|| format!("failed to attach `{rust_fn_name}` to {category}:{event}"))?;
+    Ok(())
+}
+
+/// Load + attach a single uprobe by Rust function name, target symbol,
+/// and library path. pid=None attaches to every process; the userspace
+/// PID filter on the event stream keeps only the target. Borrows `ebpf`
+/// mutably only for the duration of this call.
+fn attach_uprobe(
+    ebpf: &mut Ebpf,
+    rust_fn_name: &str,
+    symbol: &str,
+    library: &str,
+) -> Result<()> {
+    let program: &mut UProbe = ebpf
+        .program_mut(rust_fn_name)
+        .with_context(|| format!("program `{rust_fn_name}` not found in ELF"))?
+        .try_into()
+        .with_context(|| format!("program `{rust_fn_name}` is not a UProbe"))?;
+    program
+        .load()
+        .with_context(|| format!("failed to load uprobe `{rust_fn_name}` into kernel"))?;
+    program
+        .attach(Some(symbol), 0, library, None)
+        .with_context(|| format!("failed to attach `{rust_fn_name}` to {symbol} in {library}"))?;
     Ok(())
 }
 
@@ -183,23 +227,13 @@ async fn main() -> Result<()> {
         )?;
     }
 
-    // Attach the malloc uprobe to validate the userspace-function path.
-    // libc resolves to the glibc shared object on this VM; aya finds the
-    // symbol in its dynamic symbol table. pid=None traces every process,
-    // which is fine here because the userspace PID filter on the event
-    // stream discards anything that is not the target.
-    {
-        let program: &mut UProbe = ebpf
-            .program_mut("probe_malloc")
-            .context("program `probe_malloc` not found in ELF")?
-            .try_into()
-            .context("program `probe_malloc` is not a UProbe")?;
-        program
-            .load()
-            .context("failed to load uprobe `probe_malloc` into kernel")?;
-        program
-            .attach(Some("malloc"), 0, "libc", None)
-            .context("failed to attach uprobe to malloc in libc")?;
+    // Attach every uprobe in TRACED_UPROBES. Each attaches to a symbol in
+    // libcuda; pid=None traces all processes and the userspace PID filter
+    // on the event stream keeps only the target. If libcuda is absent
+    // (e.g. running on a non-GPU host) these attaches fail loudly, which
+    // is the correct signal that this binary needs a CUDA-capable target.
+    for (rust_fn_name, symbol, library) in TRACED_UPROBES {
+        attach_uprobe(&mut ebpf, rust_fn_name, symbol, library)?;
     }
 
     let events: RingBuf<_> = ebpf
@@ -211,9 +245,10 @@ async fn main() -> Result<()> {
     let mut writer = build_writer(cli.output.as_deref())?;
 
     info!(
-        "probe attached to {} syscalls ({} tracepoints), userspace-filtering for pid={}",
+        "probe attached: {} syscalls ({} tracepoints) + {} uprobes, userspace-filtering for pid={}",
         TRACED_SYSCALLS.len(),
         TRACED_SYSCALLS.len() * 2,
+        TRACED_UPROBES.len(),
         cli.pid
     );
 

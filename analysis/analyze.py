@@ -32,6 +32,17 @@ SYSCALL_NAMES: dict[int, str] = {
     257: "openat",
 }
 
+# Uprobe event ids (>= 1000) and their human names. These mirror the
+# define_uprobe! invocations in probe-ebpf/src/main.rs. Unlike syscalls,
+# uprobe events are one-sided (ENTER only) and act as phase markers in the
+# cold-start timeline rather than paired-duration measurements.
+UPROBE_NAMES: dict[int, str] = {
+    1000: "cuInit",
+    1001: "cuModuleLoadData",
+    1002: "cuMemAlloc_v2",
+    1003: "cuLaunchKernel",
+}
+
 
 def load_events(path: Path) -> list[dict]:
     events: list[dict] = []
@@ -150,6 +161,38 @@ def report_time_profile(events: list[dict], bucket_ms: int = 100) -> None:
         )
     print()
 
+def report_uprobe_markers(events: list[dict]) -> None:
+    # Uprobe events (id >= 1000) are one-sided phase markers. For each one
+    # we report how many times it fired and when, relative to the first
+    # event in the whole capture, so the CUDA-side phases can be lined up
+    # against the syscall I/O timeline.
+    enters = [ev for ev in events if ev["kind"] == 0]
+    if not enters:
+        return
+    enters.sort(key=lambda e: e["timestamp_ns"])
+    capture_start = enters[0]["timestamp_ns"]
+
+    by_id: dict[int, list[int]] = defaultdict(list)
+    for ev in enters:
+        if ev["syscall_nr"] >= 1000:
+            by_id[ev["syscall_nr"]].append(ev["timestamp_ns"])
+
+    print("=== Uprobe phase markers (libcuda) ===")
+    if not by_id:
+        print("No uprobe events captured "
+              "(libcuda not present, or none of the traced symbols were hit).\n")
+        return
+
+    print(f"{'function':<20} {'count':>8} {'first_s':>10} {'last_s':>10}")
+    print("-" * 50)
+    for event_id in sorted(by_id):
+        ts = by_id[event_id]
+        name = UPROBE_NAMES.get(event_id, f"id={event_id}")
+        first_s = (ts[0] - capture_start) / 1e9
+        last_s = (ts[-1] - capture_start) / 1e9
+        print(f"{name:<20} {len(ts):>8} {first_s:>10.3f} {last_s:>10.3f}")
+    print()
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(
@@ -181,6 +224,7 @@ def main() -> int:
     report_pair_balance(events)
     report_durations(events)
     report_time_profile(events, bucket_ms=args.bucket_ms)
+    report_uprobe_markers(events)
     return 0
 
 
