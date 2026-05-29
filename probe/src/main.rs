@@ -13,7 +13,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use aya::{Ebpf, maps::RingBuf, programs::TracePoint};
+use aya::{Ebpf, maps::RingBuf, programs::{TracePoint, UProbe}};
 use clap::Parser;
 use log::{info, warn};
 use probe_common::SyscallEvent;
@@ -181,6 +181,25 @@ async fn main() -> Result<()> {
             "syscalls",
             &format!("sys_exit_{syscall}"),
         )?;
+    }
+
+    // Attach the malloc uprobe to validate the userspace-function path.
+    // libc resolves to the glibc shared object on this VM; aya finds the
+    // symbol in its dynamic symbol table. pid=None traces every process,
+    // which is fine here because the userspace PID filter on the event
+    // stream discards anything that is not the target.
+    {
+        let program: &mut UProbe = ebpf
+            .program_mut("probe_malloc")
+            .context("program `probe_malloc` not found in ELF")?
+            .try_into()
+            .context("program `probe_malloc` is not a UProbe")?;
+        program
+            .load()
+            .context("failed to load uprobe `probe_malloc` into kernel")?;
+        program
+            .attach(Some("malloc"), 0, "libc", None)
+            .context("failed to attach uprobe to malloc in libc")?;
     }
 
     let events: RingBuf<_> = ebpf

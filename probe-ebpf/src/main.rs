@@ -23,9 +23,9 @@
 
 use aya_ebpf::{
     helpers::{bpf_get_current_pid_tgid, bpf_ktime_get_ns},
-    macros::{map, tracepoint},
+    macros::{map, tracepoint, uprobe},
     maps::RingBuf,
-    programs::TracePointContext,
+    programs::{ProbeContext, TracePointContext},
 };
 use probe_common::SyscallEvent;
 
@@ -125,6 +125,38 @@ define_syscall_tracepoint!(openat, 257);
 define_syscall_tracepoint!(read, 0);
 define_syscall_tracepoint!(mmap, 9);
 define_syscall_tracepoint!(close, 3);
+
+// ---- Uprobe section (userspace function tracing) ----
+//
+// Event IDs >= 1000 distinguish uprobe events from syscall events
+// (which use the real syscall number, all < 1000) in the shared
+// SyscallEvent stream. The userspace analysis splits on this boundary.
+//
+// This first uprobe targets libc malloc purely to validate the uprobe
+// mechanism end-to-end on the dev VM, where no GPU / libcuda exists.
+// It will be replaced by libcuda C-API probes (cuInit, cuModuleLoad,
+// cuMemAlloc, ...) once the attach + event path is proven.
+const EVENT_ID_MALLOC: u32 = 1000;
+
+#[uprobe]
+pub fn probe_malloc(_ctx: ProbeContext) -> u32 {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let pid = (pid_tgid >> 32) as u32;
+    let tid = pid_tgid as u32;
+    let timestamp_ns = unsafe { bpf_ktime_get_ns() };
+
+    let Some(mut entry) = EVENTS.reserve::<SyscallEvent>(0) else {
+        return 0;
+    };
+
+    let event = SyscallEvent::new_enter(timestamp_ns, pid, tid, EVENT_ID_MALLOC);
+    unsafe {
+        core::ptr::write(entry.as_mut_ptr(), event);
+    }
+    entry.submit(0);
+
+    0
+}
 
 #[cfg(not(test))]
 #[panic_handler]
