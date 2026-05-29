@@ -233,7 +233,13 @@ async fn main() -> Result<()> {
     // (e.g. running on a non-GPU host) these attaches fail loudly, which
     // is the correct signal that this binary needs a CUDA-capable target.
     for (rust_fn_name, symbol, library) in TRACED_UPROBES {
+        // Entry uprobe: fires when the function is called.
         attach_uprobe(&mut ebpf, rust_fn_name, symbol, library)?;
+        // Return uretprobe: fires when it returns. The kernel program is
+        // named <rust_fn_name>_ret and is a uretprobe; aya attaches it with
+        // the same call, the probe type is fixed by the loaded program.
+        let ret_fn_name = format!("{rust_fn_name}_ret");
+        attach_uprobe(&mut ebpf, &ret_fn_name, symbol, library)?;
     }
 
     let events: RingBuf<_> = ebpf
@@ -245,7 +251,7 @@ async fn main() -> Result<()> {
     let mut writer = build_writer(cli.output.as_deref())?;
 
     info!(
-        "probe attached: {} syscalls ({} tracepoints) + {} uprobes, userspace-filtering for pid={}",
+        "probe attached: {} syscalls ({} tracepoints) + {} uprobes (entry+return), userspace-filtering for pid={}",
         TRACED_SYSCALLS.len(),
         TRACED_SYSCALLS.len() * 2,
         TRACED_UPROBES.len(),

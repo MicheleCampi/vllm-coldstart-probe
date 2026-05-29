@@ -26,9 +26,9 @@
 
 use aya_ebpf::{
     helpers::{bpf_get_current_pid_tgid, bpf_ktime_get_ns},
-    macros::{map, tracepoint, uprobe},
+    macros::{map, tracepoint, uprobe, uretprobe},
     maps::RingBuf,
-    programs::{ProbeContext, TracePointContext},
+    programs::{ProbeContext, RetProbeContext, TracePointContext},
 };
 use probe_common::SyscallEvent;
 
@@ -157,15 +157,47 @@ fn emit_uprobe(event_id: u32) -> u32 {
     0
 }
 
-/// Generates an `#[uprobe]` function named `probe_<short>` that emits an
-/// event tagged with `event_id`. The userspace side attaches it to a
-/// concrete symbol + library; the kernel side only needs the event id.
+/// Shared emit logic for uprobe RETURN events. Emits an EXIT-kind event
+/// carrying the same event_id, so userspace pairs entry/return the same
+/// way it pairs syscall enter/exit. The CUDA return value is not captured
+/// (passed as 0): for cold-start phase timing the duration matters, not
+/// the CUresult code.
+#[inline(always)]
+fn emit_uprobe_ret(event_id: u32) -> u32 {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let pid = (pid_tgid >> 32) as u32;
+    let tid = pid_tgid as u32;
+    let timestamp_ns = unsafe { bpf_ktime_get_ns() };
+
+    let Some(mut entry) = EVENTS.reserve::<SyscallEvent>(0) else {
+        return 0;
+    };
+
+    let event = SyscallEvent::new_exit(timestamp_ns, pid, tid, event_id, 0);
+    unsafe {
+        core::ptr::write(entry.as_mut_ptr(), event);
+    }
+    entry.submit(0);
+
+    0
+}
+
+/// Generates an entry uprobe `probe_<short>` and a return uretprobe
+/// `probe_<short>_ret`, both tagged with `event_id`. The userspace side
+/// attaches the entry function as a uprobe and the _ret function as a
+/// uretprobe to the same symbol; pairing entry/return in analysis gives
+/// the time spent inside each CUDA call.
 macro_rules! define_uprobe {
     ($short:ident, $event_id:expr) => {
         ::paste::paste! {
             #[uprobe]
             pub fn [<probe_ $short>](_ctx: ProbeContext) -> u32 {
                 emit_uprobe($event_id)
+            }
+
+            #[uretprobe]
+            pub fn [<probe_ $short _ret>](_ctx: RetProbeContext) -> u32 {
+                emit_uprobe_ret($event_id)
             }
         }
     };

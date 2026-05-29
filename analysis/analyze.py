@@ -194,6 +194,63 @@ def report_uprobe_markers(events: list[dict]) -> None:
     print()
 
 
+
+def report_uprobe_durations(events: list[dict]) -> None:
+    # Pair entry/return by (pid, tid, event_id) in sequential order within
+    # each tid, identical to the syscall pairing. A CUDA driver call is
+    # synchronous from the calling thread's view, so entry and return
+    # alternate cleanly per tid; nested calls to the same symbol on one
+    # thread would break this, but the libcuda entry points we trace do
+    # not re-enter themselves.
+    events_by_key: dict[tuple[int, int, int], list[dict]] = defaultdict(list)
+    for ev in events:
+        if ev["syscall_nr"] < 1000:
+            continue
+        key = (ev["pid"], ev["tid"], ev["syscall_nr"])
+        events_by_key[key].append(ev)
+
+    durations_by_id: dict[int, list[int]] = defaultdict(list)
+    for key, ev_list in events_by_key.items():
+        ev_list.sort(key=lambda e: e["timestamp_ns"])
+        enter = None
+        for ev in ev_list:
+            if ev["kind"] == 0:
+                enter = ev
+            elif ev["kind"] == 1 and enter is not None:
+                durations_by_id[ev["syscall_nr"]].append(
+                    ev["timestamp_ns"] - enter["timestamp_ns"]
+                )
+                enter = None
+
+    print("=== Uprobe call durations (time inside each libcuda call) ===")
+    if not durations_by_id:
+        print("No paired uprobe entry/return events "
+              "(capture predates uretprobe support, or libcuda was not used).\n")
+        return
+
+    print(
+        f"{'function':<20} {'count':>8} {'total_ms':>12} "
+        f"{'p50_us':>10} {'p95_us':>10} {'p99_us':>10} {'max_ms':>10}"
+    )
+    print("-" * 82)
+    total_cuda_ns = 0
+    for event_id in sorted(durations_by_id):
+        durs = sorted(durations_by_id[event_id])
+        n = len(durs)
+        total_ns = sum(durs)
+        total_cuda_ns += total_ns
+        p50 = durs[n // 2]
+        p95 = durs[int(n * 0.95)]
+        p99 = durs[int(n * 0.99)]
+        max_ns = durs[-1]
+        name = UPROBE_NAMES.get(event_id, f"id={event_id}")
+        print(
+            f"{name:<20} {n:>8} {total_ns / 1e6:>12.2f} "
+            f"{p50 / 1000:>10.2f} {p95 / 1000:>10.2f} "
+            f"{p99 / 1000:>10.2f} {max_ns / 1e6:>10.2f}"
+        )
+    print("-" * 82)
+    print(f"Sum of all libcuda call time: {total_cuda_ns / 1e9:.3f} s\n")
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Analyze a cold-start JSONL capture from vllm-probe."
@@ -225,6 +282,7 @@ def main() -> int:
     report_durations(events)
     report_time_profile(events, bucket_ms=args.bucket_ms)
     report_uprobe_markers(events)
+    report_uprobe_durations(events)
     return 0
 
 
