@@ -23,10 +23,13 @@ Captures both sides of vLLM cold-start on a real GPU:
   `cuMemAlloc_v2`, `cuLaunchKernel`, each traced entry + return so the
   time spent inside each driver call is measured, not just when it fires.
 
-Validated end-to-end on a Lambda Labs A10 (Ubuntu 22.04, kernel
-6.8.0-nvidia) loading Mistral-7B-Instruct-v0.3 under vLLM 0.22. See
+Validated end-to-end on Lambda Labs A10 and A100 (Ubuntu 22.04, kernel
+6.8.0-nvidia) under vLLM 0.22, across a four-phase study: where cold-start
+time goes (Phase A), how it scales with model size (B), how quantization
+changes it (C), and what common workarounds actually cost (D). See the
+Findings sections below.
 
-## Findings (Mistral-7B, A10, FP16, enforce_eager)
+## Findings — Phase A: where the time goes (Mistral-7B, FP16, eager)
 
 First full capture, page cache dropped immediately before launch, so
 weight reads hit the SSD rather than RAM. Wall-clock cold-start was
@@ -60,6 +63,59 @@ inside these driver calls: it is GPU compute, synchronization, and
 Python-level work between the traced calls, which the next round of
 probes (more libcuda / libtorch entry points) can attribute further.
 Findings below for what the first full capture revealed.
+
+## Findings — Phase B: scaling with model size
+
+Same probe against Qwen2.5-Instruct-AWQ at three sizes (7B/14B/32B on
+A10/A10/A100), quantization held constant to isolate size:
+
+| model   | params | load time | kernel I/O | cuLaunchKernel | cuMemAlloc |
+|---------|--------|-----------|-----------|----------------|------------|
+| 7B-AWQ  | 7B     | 18.97 s   | ~1.86 s   | 3,475          | 161        |
+| 14B-AWQ | 14B    | 25.02 s   | ~2.27 s   | 6,547          | 372        |
+| 32B-AWQ | 32B    | 28.36 s   | ~1.93 s   | 8,691          | 418        |
+
+Parameters grow 4.6x, load time grows 1.5x: cold start scales strongly
+sub-linearly. `cuInit`/`cuModuleLoadData` are fixed costs. Kernel I/O is
+flat (AWQ weights are small; not I/O-bound at any size). The *count* of
+kernels and allocations grows sub-linearly; the *time* inside launches is
+dominated by noisy synchronization outliers, not by weight volume.
+
+## Findings — Phase C: the quantization tax
+
+Same model (Qwen2.5-7B-Instruct), three precisions, on the same A10:
+
+| precision | load time | cuLaunchKernel | cuMemAlloc |
+|-----------|-----------|----------------|------------|
+| FP16      | 15.05 s   | 843            | 164        |
+| AWQ 4-bit | 18.97 s   | 3,475          | 161        |
+| GPTQ 4-bit| 12.32 s   | 2,019          | 166        |
+
+`cuMemAlloc` is constant (same architecture), but quantization multiplies
+warmup kernels: AWQ issues 4.1x the `cuLaunchKernel` of FP16, GPTQ 2.4x —
+the dequantization kernels each quantized layer adds. AWQ and GPTQ are not
+equivalent at cold start. Load time does not track kernel count directly:
+GPTQ is fastest despite more kernels than FP16, because it reads ~5 GB
+from disk versus FP16's ~15 GB.
+
+## Findings — Phase D: what the workarounds actually cost
+
+Two interventions on Qwen2.5-7B-Instruct FP16, A10, against the eager
+cold-cache baseline (15.05 s, 843 kernels):
+
+| config              | load time | cuLaunchKernel |
+|---------------------|-----------|----------------|
+| baseline (eager)    | 15.05 s   | 843            |
+| CUDA graphs enabled | 47.72 s   | 66,353         |
+| warm page cache     | 11.70 s   | 843            |
+
+Enabling CUDA graphs (`enforce_eager=False`) makes cold start **3.2x
+slower** and issues **79x** the kernels: vLLM runs every batch shape to
+capture the graphs. CUDA graphs speed up steady-state inference but pay a
+brutal cold-start price — a real trade-off for scale-to-zero workloads. A
+warm page cache saves ~3 s (the `read` I/O), confirming I/O is real but a
+minority of cold start. The lever that moves cold start most is a config
+flag, not the disk.
 
 ## Workspace layout
 
