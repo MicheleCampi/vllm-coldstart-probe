@@ -15,14 +15,51 @@ or a file.
 
 ## Status
 
-Functional capture for four syscalls: `openat`, `read`, `mmap`, `close`.
-Each is traced enter + exit. Validated end-to-end on Linux 6.8 with a
-Python-generated syscall workload; ring buffer absorbs the traffic
-without drops at the current 256 KiB sizing.
+Captures both sides of vLLM cold-start on a real GPU:
 
-Not yet integrated with a real vLLM workload — that work lands next,
-along with uprobes for libtorch and libcuda to capture the userspace
-side of the cold-start timeline.
+- **Syscalls** (kernel tracepoints): `openat`, `read`, `mmap`, `close`,
+  each traced enter + exit for per-call duration.
+- **libcuda C API** (uprobes + uretprobes): `cuInit`, `cuModuleLoadData`,
+  `cuMemAlloc_v2`, `cuLaunchKernel`, each traced entry + return so the
+  time spent inside each driver call is measured, not just when it fires.
+
+Validated end-to-end on a Lambda Labs A10 (Ubuntu 22.04, kernel
+6.8.0-nvidia) loading Mistral-7B-Instruct-v0.3 under vLLM 0.22. See
+
+## Findings (Mistral-7B, A10, FP16, enforce_eager)
+
+First full capture, page cache dropped immediately before launch, so
+weight reads hit the SSD rather than RAM. Wall-clock cold-start was
+about 18 seconds. The probe attributes time as follows.
+
+Kernel I/O — total ~1.22 s:
+
+| syscall | calls  | total   | notes                          |
+|---------|--------|---------|--------------------------------|
+| read    | 23,137 | 1037 ms | p50 1.1 us, max 44 ms          |
+| openat  | 19,454 |  154 ms | file + library lookups         |
+| mmap    |  1,846 |   16 ms | few; weights are read(), mmap'd|
+| close   | 16,803 |   16 ms |                                |
+
+libcuda calls — total ~1.49 s, but dominated by a few outliers:
+
+| function         | calls | total   | p50    | max     |
+|------------------|-------|---------|--------|---------|
+| cuLaunchKernel   |   947 | 1337 ms | 4.2 us | 1287 ms |
+| cuInit           |     6 |  123 ms | 5 us   |  123 ms |
+| cuMemAlloc_v2    |   179 |   34 ms | 106 us |    2 ms |
+| cuModuleLoadData |     1 |    1 ms | 780 us |    1 ms |
+
+The headline: cold-start is neither I/O-bound nor dominated by the
+volume of CUDA calls. Kernel I/O is ~7% of wall time. The 947
+cuLaunchKernel calls are individually trivial (p50 4.2 us) except for
+**one** that takes 1.29 s — almost certainly the first kernel launch
+triggering JIT compilation. Likewise cuInit is one 123 ms call plus
+five no-ops. Roughly 85% of the ~18 s is spent neither in syscalls nor
+inside these driver calls: it is GPU compute, synchronization, and
+Python-level work between the traced calls, which the next round of
+probes (more libcuda / libtorch entry points) can attribute further.
+Findings below for what the first full capture revealed.
 
 ## Workspace layout
 
@@ -115,9 +152,12 @@ per-call duration.
 - **x86_64 only.** Syscall numbers are hardcoded for this
   architecture. Adding a build-time arch dispatch is straightforward
   but not done yet.
-- **No uprobe support yet.** Only kernel tracepoints. Userspace
-  function tracing (libtorch, libcuda) is planned for phase
-  decomposition beyond the kernel boundary.
+- **Userspace tracing covers libcuda only.** Four driver entry points
+  are traced (cuInit, cuModuleLoadData, cuMemAlloc_v2, cuLaunchKernel).
+  The ~85% of cold-start that sits between these calls — GPU compute,
+  libtorch, Python — is not yet attributed; more entry points would
+  narrow it down. Uretprobes record call duration but not the CUresult
+  return value (not needed for timing).
 
 ## License
 
