@@ -129,11 +129,18 @@ define_syscall_tracepoint!(close, 3);
 // (which use the real syscall number, all < 1000) in the shared
 // SyscallEvent stream. The userspace analysis splits on this boundary.
 //
-// Each uprobe fires on ENTER of a userspace library function. We do not
-// capture the return side: a uretprobe needs a separate program type, and
-// the entry timing alone already marks when each phase of cold-start
-// begins. Duration between consecutive markers is recoverable in analysis
-// from the timestamps.
+// Each libcuda symbol gets a pair: a uprobe on ENTER and a uretprobe on
+// RETURN, both emitting the same event_id with different `kind` values.
+// Pairing them in analysis gives the time spent inside the call rather
+// than only the interval between successive entries — which matters here,
+// because the finding this probe exists for is a single cuLaunchKernel
+// that takes 1.29 s against a 4.2 us median, and an interval between two
+// entries could not tell that apart from a gap in the caller.
+//
+// An earlier version captured entries only, and this comment described
+// that. The uretprobe side arrived with the `define_uprobe!` pair below;
+// the data files carry both shapes, with `-uretprobe` in the name for the
+// paired captures.
 
 /// Shared emit logic for uprobe ENTER events. Inlined so each generated
 /// uprobe stays a single compact eBPF program.
