@@ -1,0 +1,11 @@
+file	loader_pid	enginecore_pid
+mistral-7b-a10-cold-start.jsonl	2899	3001
+mistral-7b-a10-cold-start-with-uprobe.jsonl	3025	3127
+mistral-7b-a10-cold-start-uretprobe.jsonl	2534	2637
+qwen2.5-7b-awq-a10-coldstart.jsonl	3100	3275
+qwen2.5-14b-awq-a10-coldstart.jsonl	3391	3566
+qwen2.5-32b-awq-a100-coldstart.jsonl	2584	2762
+qwen2.5-7b-fp16-a10-coldstart.jsonl	2816	2920
+qwen2.5-7b-gptq-a10-coldstart.jsonl	3038	3212
+qwen2.5-7b-fp16-cudagraph-a10-coldstart.jsonl	2530	2635
+qwen2.5-7b-fp16-warmcache-a10-coldstart.jsonl	3003	3107
