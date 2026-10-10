@@ -2,16 +2,25 @@
 """
 Analyze a cold-start JSONL capture from vllm-probe.
 
-Produces three reports on stdout:
+Produces five reports on stdout:
   1. Per-syscall pair counts (enter/exit balance check).
   2. Per-syscall duration statistics (count, total time, p50/p95/p99/max).
   3. Time profile in 100ms buckets across the capture window.
+  4. libcuda uprobe phase markers (count, first and last time).
+  5. libcuda call durations, from paired uprobe entry and return events.
 
 Usage:
-    python3 analyze.py <path/to/capture.jsonl>
+    python3 analyze.py <path/to/capture.jsonl> [--pid PID ...] [--bucket-ms N]
+
+Without --pid every event in the file is counted; a capture taken with
+`vllm-probe --pid 0` holds every process on the node. --pid keeps only the
+events of the given process ids and can be repeated, e.g. for the loader
+and vLLM's EngineCore subprocess (analysis/CAPTURES.md lists them).
 
 The expected schema is one JSON object per line with fields:
     timestamp_ns, pid, tid, syscall_nr, kind (0=enter, 1=exit), ret
+syscall_nr >= 1000 are libcuda uprobes (see UPROBE_NAMES), where kind 0 is
+the function's entry and kind 1 its return.
 """
 
 from __future__ import annotations
@@ -33,9 +42,9 @@ SYSCALL_NAMES: dict[int, str] = {
 }
 
 # Uprobe event ids (>= 1000) and their human names. These mirror the
-# define_uprobe! invocations in probe-ebpf/src/main.rs. Unlike syscalls,
-# uprobe events are one-sided (ENTER only) and act as phase markers in the
-# cold-start timeline rather than paired-duration measurements.
+# define_uprobe! invocations in probe-ebpf/src/main.rs. Each fires on entry
+# (kind 0) and, through its uretprobe, on return (kind 1): the entries serve
+# as phase markers, and entry/return pairs give the time inside each call.
 UPROBE_NAMES: dict[int, str] = {
     1000: "cuInit",
     1001: "cuModuleLoadData",
@@ -266,6 +275,13 @@ def main() -> int:
         default=100,
         help="Time profile bucket size in milliseconds (default: 100).",
     )
+    parser.add_argument(
+        "--pid",
+        type=int,
+        action="append",
+        help="Keep only events from this process id; repeat for several. "
+        "Default: every event in the file.",
+    )
     args = parser.parse_args()
 
     if not args.path.exists():
@@ -277,7 +293,19 @@ def main() -> int:
         print(f"error: no events in {args.path}", file=sys.stderr)
         return 1
 
-    print(f"Loaded {len(events)} events from {args.path}\n")
+    if args.pid:
+        keep = set(args.pid)
+        total = len(events)
+        events = [e for e in events if e.get("pid") in keep]
+        if not events:
+            print(f"error: no events from pid(s) {sorted(keep)} in {args.path}",
+                  file=sys.stderr)
+            return 1
+        pids = ", ".join(str(x) for x in sorted(keep))
+        print(f"Loaded {total} events from {args.path}, "
+              f"kept {len(events)} from pid(s) {pids}\n")
+    else:
+        print(f"Loaded {len(events)} events from {args.path}\n")
     report_pair_balance(events)
     report_durations(events)
     report_time_profile(events, bucket_ms=args.bucket_ms)
