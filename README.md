@@ -10,8 +10,8 @@ memory mapping, fd cleanup).
 
 The userspace consumer (`vllm-probe`) loads the eBPF program, attaches
 it to the kernel tracepoints, drains the ring buffer on a dedicated
-blocking thread, filters by PID, and streams events as JSONL to stdout
-or a file.
+blocking thread, filters by PID (`--pid 0` keeps every process), and
+streams events as JSONL to stdout or a file.
 
 ## Status
 
@@ -24,25 +24,57 @@ Captures both sides of vLLM cold-start on a real GPU:
   time spent inside each driver call is measured, not just when it fires.
 
 Validated end-to-end on Lambda Labs A10 and A100 (Ubuntu 22.04, kernel
-6.8.0-nvidia) under vLLM 0.22, across a four-phase study: where cold-start
+6.8.0-nvidia). The vLLM version was not captured per run; the notes taken
+during the sessions name 0.21.0 for the first node and 0.22 for the phase B
+node. The study has four phases: where cold-start
 time goes (Phase A), how it scales with model size (B), how quantization
 changes it (C), and what common workarounds actually cost (D). See the
 Findings sections below.
 
+## How the numbers are produced
+
+- **Captures.** Ten, listed in [`analysis/CAPTURES.md`](analysis/CAPTURES.md)
+  with their SHA-256, start time, GPU and the PIDs involved. The capture
+  files are not in this repository: nine hold every process on the node.
+  The scripts that took them are in [`capture/`](capture/).
+- **Syscall figures** are `analysis/analyze.py` on each capture filtered to
+  the loader and vLLM's EngineCore PIDs (`--pid`); `analysis/summarize.sh`
+  regenerates every output in `analysis/summaries/`. Without the filter the
+  counts include the node's other processes: for the 14B capture the
+  syscall time is 24.82 s instead of 2.27 s.
+- **libcuda figures** come from EngineCore alone, filtered or not.
+- **Load time** is the time to construct `LLM(...)` as the capture loader
+  prints it (`capture/load_model.py`): building the engine, not serving a
+  request.
+- **What the probe does not see.** The weights do not pass through the
+  four traced syscalls: in the seven captures checked, the loader's and
+  EngineCore's `read`s move 0.53 to 0.54 GiB per load, while Mistral-7B's
+  weights alone are 13.5 GiB (its three safetensors shards on Hugging
+  Face). Syscall figures are time spent in those syscalls, not disk I/O.
+- **Lost events.** The probe's writer dropped up to 1,493 events per
+  capture (CAPTURES.md); losses inside the kernel ring buffer are not
+  counted.
+
 ## Findings — Phase A: where the time goes (Mistral-7B, FP16, eager)
 
-First full capture, page cache dropped immediately before launch, so
-weight reads hit the SSD rather than RAM. Wall-clock cold-start was
-about 18 seconds. The probe attributes time as follows.
+Capture `mistral-7b-a10-cold-start-uretprobe.jsonl` (30 May), page cache
+dropped immediately before launch. Its load time was not kept: the only
+load time recorded for a phase A capture, 11.73 s, comes from the first
+capture, which filtered on the loader's PID and so has none of
+EngineCore's events.
+Syscall figures are `analyze.py --pid 2534 --pid 2637` on this capture.
 
-Kernel I/O — total ~1.22 s:
+Syscall time — total ~1.22 s:
 
 | syscall | calls  | total   | notes                          |
 |---------|--------|---------|--------------------------------|
 | read    | 23,137 | 1037 ms | p50 1.1 us, max 44 ms          |
 | openat  | 19,454 |  154 ms | file + library lookups         |
-| mmap    |  1,846 |   16 ms | few; weights are read(), mmap'd|
+| mmap    |  1,846 |   16 ms | file mappings; faults untraced  |
 | close   | 16,803 |   16 ms |                                |
+
+These `read`s move 0.53 GiB, against 13.5 GiB of weights: the weights
+reach memory some other way, so this is syscall time, not disk I/O.
 
 libcuda calls — total ~1.49 s, but dominated by a few outliers:
 
@@ -53,33 +85,36 @@ libcuda calls — total ~1.49 s, but dominated by a few outliers:
 | cuMemAlloc_v2    |   179 |   34 ms | 106 us |    2 ms |
 | cuModuleLoadData |     1 |    1 ms | 780 us |    1 ms |
 
-The headline: cold-start is neither I/O-bound nor dominated by the
-volume of CUDA calls. Kernel I/O is ~7% of wall time. The 947
-cuLaunchKernel calls are individually trivial (p50 4.2 us) except for
-**one** that takes 1.29 s — almost certainly the first kernel launch
-triggering JIT compilation. Likewise cuInit is one 123 ms call plus
-five no-ops. Roughly 85% of the ~18 s is spent neither in syscalls nor
-inside these driver calls: it is GPU compute, synchronization, and
-Python-level work between the traced calls, which the next round of
-probes (more libcuda / libtorch entry points) can attribute further.
-Findings below for what the first full capture revealed.
+The traced calls take 1.22 s in the four syscalls and 1.49 s inside the four
+libcuda functions. The 947 cuLaunchKernel calls are individually trivial
+(p50 4.2 us) except for **one** that takes 1.29 s: launch 516, 7.21 s after
+the first, so not a first-launch cost. cuInit is one 123 ms call plus five
+that return in microseconds. How much of the load is disk I/O this capture
+cannot say: the weights do not pass through the traced syscalls, and its
+load time was not kept, so no share of the total is computed here.
 
 ## Findings — Phase B: scaling with model size
 
 Same probe against Qwen2.5-Instruct-AWQ at three sizes (7B/14B/32B on
-A10/A10/A100), quantization held constant to isolate size:
+A10/A10/A100). Quantization is held constant, but the 32B ran on an A100,
+so its row changes the GPU as well as the size:
 
-| model   | params | load time | kernel I/O | cuLaunchKernel | cuMemAlloc |
+| model   | params | load time | syscall time | cuLaunchKernel | cuMemAlloc |
 |---------|--------|-----------|-----------|----------------|------------|
 | 7B-AWQ  | 7B     | 18.97 s   | ~1.86 s   | 3,475          | 161        |
 | 14B-AWQ | 14B    | 25.02 s   | ~2.27 s   | 6,547          | 372        |
 | 32B-AWQ | 32B    | 28.36 s   | ~1.93 s   | 8,691          | 418        |
 
-Parameters grow 4.6x, load time grows 1.5x: cold start scales strongly
-sub-linearly. `cuInit`/`cuModuleLoadData` are fixed costs. Kernel I/O is
-flat (AWQ weights are small; not I/O-bound at any size). The *count* of
-kernels and allocations grows sub-linearly; the *time* inside launches is
-dominated by noisy synchronization outliers, not by weight volume.
+The 14B capture dropped 1,493 events, so its counts are lower bounds. On
+the same A10, doubling the parameters (7B to 14B) makes the load 1.32x
+longer; the 32B, on the A100, takes 1.50x the 7B's time with 4.6x its
+parameters. `cuInit` and `cuModuleLoadData` are called 6 times and once at
+every size. Syscall time stays around 2 s; as in phase A, the traced `read`s
+move 0.54 GiB at every size, not the weights. Kernel launches grow
+sub-linearly (1.88x for 2x the parameters, 2.50x for 4.6x); allocations grow
+2.31x from 7B to 14B and 2.60x to 32B. The time inside launches is dominated
+by single calls: the longest launch is 93%, 57% and 43% of it (7B, 14B,
+32B).
 
 ## Findings — Phase C: the quantization tax
 
@@ -91,12 +126,13 @@ Same model (Qwen2.5-7B-Instruct), three precisions, on the same A10:
 | AWQ 4-bit | 18.97 s   | 3,475          | 161        |
 | GPTQ 4-bit| 12.32 s   | 2,019          | 166        |
 
-`cuMemAlloc` is constant (same architecture), but quantization multiplies
-warmup kernels: AWQ issues 4.1x the `cuLaunchKernel` of FP16, GPTQ 2.4x —
-the dequantization kernels each quantized layer adds. AWQ and GPTQ are not
-equivalent at cold start. Load time does not track kernel count directly:
-GPTQ is fastest despite more kernels than FP16, because it reads ~5 GB
-from disk versus FP16's ~15 GB.
+`cuMemAlloc` stays at 161 to 166 calls, while quantization multiplies kernel
+launches: AWQ issues 4.1x the `cuLaunchKernel` of FP16, GPTQ 2.4x. AWQ and
+GPTQ are not equivalent at cold start. Load time does not track kernel
+count directly: GPTQ is fastest despite more kernels than FP16. Its 4-bit
+checkpoint is smaller; the probe cannot show whether that is why, since the
+traced `read`s move 0.53 to 0.54 GiB in all three captures. The GPTQ
+capture dropped 539 events and the FP16 one 114.
 
 ## Findings — Phase D: what the workarounds actually cost
 
@@ -109,13 +145,15 @@ cold-cache baseline (15.05 s, 843 kernels):
 | CUDA graphs enabled | 47.72 s   | 66,353         |
 | warm page cache     | 11.70 s   | 843            |
 
-Enabling CUDA graphs (`enforce_eager=False`) makes cold start **3.2x
-slower** and issues **79x** the kernels: vLLM runs every batch shape to
-capture the graphs. CUDA graphs speed up steady-state inference but pay a
-brutal cold-start price — a real trade-off for scale-to-zero workloads. A
-warm page cache saves ~3 s (the `read` I/O), confirming I/O is real but a
-minority of cold start. The lever that moves cold start most is a config
-flag, not the disk.
+Enabling CUDA graphs (`enforce_eager=False`) makes the load **3.2x
+slower** and issues **79x** the kernel launches, a cost to weigh for
+scale-to-zero workloads. A
+warm page cache cuts the load by 3.35 s, while traced `read` time falls by
+only 0.66 s (1.045 to 0.383 s): most of the saving lies outside the traced
+syscalls. The warm load followed a discarded warm-up load of the same model
+(`capture/run_capture_d.sh`). The largest change measured is still the
+config flag: CUDA graphs add 32.67 s. The warm-cache capture dropped 1,256
+events and the CUDA-graph one 82, so their counts are lower bounds.
 
 ## Workspace layout
 
@@ -163,9 +201,11 @@ sudo ./target/debug/vllm-probe --pid 12345 --duration 30
 
 CLI flags:
 
-- `--pid <PID>` (required): the process to trace. Currently single-PID;
-  multi-PID requires either a userspace-side filter list or revisiting
-  kernel-side filtering (see Limitations).
+- `--pid <PID>` (required): the process to trace, or `0` for every process
+  on the node (`probe/src/main.rs:284`). vLLM's EngineCore is a subprocess
+  started after the probe attaches, so a single PID misses it: the captures
+  in `data/` use `0` and are filtered afterwards with
+  `analysis/analyze.py --pid`.
 - `--duration <SECS>` (default 60): how long to capture before detaching.
 - `--output <PATH>` (optional): JSONL output file. Stdout if unset.
 
@@ -192,6 +232,10 @@ One JSON object per line. Schema:
   `mmap = 9`, `close = 3`.
 - `ret`: syscall return value on EXIT (positive = success/fd,
   negative = `-errno`). Always 0 on ENTER.
+- `syscall_nr` 1000 to 1003 are libcuda uprobes: `cuInit`,
+  `cuModuleLoadData`, `cuMemAlloc_v2`, `cuLaunchKernel`. `kind` is 0 on the
+  function's entry and 1 on its return; `ret` is always 0, since the
+  CUresult is not captured.
 
 Pair ENTER and EXIT records on `(pid, tid, syscall_nr)` to compute
 per-call duration.
@@ -210,10 +254,16 @@ per-call duration.
   but not done yet.
 - **Userspace tracing covers libcuda only.** Four driver entry points
   are traced (cuInit, cuModuleLoadData, cuMemAlloc_v2, cuLaunchKernel).
-  The ~85% of cold-start that sits between these calls — GPU compute,
-  libtorch, Python — is not yet attributed; more entry points would
-  narrow it down. Uretprobes record call duration but not the CUresult
-  return value (not needed for timing).
+  The time between these calls — GPU compute, libtorch, Python — is not
+  attributed; more entry points would narrow it down. Uretprobes record
+  call duration but not the CUresult return value (not needed for timing).
+- **Weight I/O is not traced.** The weights do not pass through the four
+  traced syscalls (see "How the numbers are produced"), so the probe
+  cannot say what share of a load is disk I/O.
+- **Event loss is only partly counted.** The writer counts the events it
+  drops (`probe/src/main.rs:161-162`); when the kernel ring buffer is full,
+  `EVENTS.reserve` fails and the event is lost without a count
+  (`probe-ebpf/src/main.rs`).
 
 ## License
 
