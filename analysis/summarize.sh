@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Regenerate analysis/summaries/ from the captures in data/, which are not
-# in this repository (CAPTURES.md says why). Each capture is checked against
-# SHA256SUMS first, then analysed on the loader and EngineCore PIDs listed
-# in captures.tsv, the filter the README's tables use.
+# Regenerate analysis/summaries/ from the captures in data/, downloaded from
+# the release captures-2026-05 (CAPTURES.md says how). Each capture is checked
+# against SHA256SUMS first, then analysed on the loader and EngineCore PIDs
+# listed in captures.tsv, the filter the README's tables use.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 sha256sum -c --quiet analysis/SHA256SUMS

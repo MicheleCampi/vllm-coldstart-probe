@@ -35,7 +35,9 @@ Findings sections below.
 
 - **Captures.** Ten, listed in [`analysis/CAPTURES.md`](analysis/CAPTURES.md)
   with their SHA-256, start time, GPU and the PIDs involved. The capture
-  files are not in this repository: nine hold every process on the node.
+  files are xz-compressed assets of the release
+  [`captures-2026-05`](https://github.com/MicheleCampi/vllm-coldstart-probe/releases/tag/captures-2026-05),
+  not part of the git tree; CAPTURES.md says how to check and use them.
   The scripts that took them are in [`capture/`](capture/).
 - **Syscall figures** are `analysis/analyze.py` on each capture filtered to
   the loader and vLLM's EngineCore PIDs (`--pid`); `analysis/summarize.sh`
@@ -203,8 +205,8 @@ CLI flags:
 
 - `--pid <PID>` (required): the process to trace, or `0` for every process
   on the node (`probe/src/main.rs:284`). vLLM's EngineCore is a subprocess
-  started after the probe attaches, so a single PID misses it: the captures
-  in `data/` use `0` and are filtered afterwards with
+  started after the probe attaches, so a single PID misses it: nine of the
+  ten captures use `0` and are filtered afterwards with
   `analysis/analyze.py --pid`.
 - `--duration <SECS>` (default 60): how long to capture before detaching.
 - `--output <PATH>` (optional): JSONL output file. Stdout if unset.

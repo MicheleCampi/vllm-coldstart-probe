@@ -173,8 +173,8 @@ def report_time_profile(events: list[dict], bucket_ms: int = 100) -> None:
 def report_uprobe_markers(events: list[dict]) -> None:
     # Uprobe events (id >= 1000) are one-sided phase markers. For each one
     # we report how many times it fired and when, relative to the first
-    # event in the whole capture, so the CUDA-side phases can be lined up
-    # against the syscall I/O timeline.
+    # entry event analysed (with --pid, the first of the kept PIDs), so the
+    # CUDA-side phases can be lined up against the syscall I/O timeline.
     enters = [ev for ev in events if ev["kind"] == 0]
     if not enters:
         return
