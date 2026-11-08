@@ -5,8 +5,10 @@ eBPF-based investigation tool for vLLM cold-start latency on NVIDIA GPUs.
 Captures kernel-side syscall traces during model load to support phase
 decomposition of cold-start time. Each tracked syscall produces an
 ENTER/EXIT event pair so userspace can compute per-call duration and
-attribute latency to specific phases (file lookup, weight bytes read,
-memory mapping, fd cleanup).
+attribute latency to specific phases (file lookup, reads, memory mapping,
+fd cleanup). The model weights do not pass through these syscalls: the
+traced `read`s move about 0.5 GiB per load against 13.5 GiB of
+Mistral-7B weights (see "What the probe does not see").
 
 The userspace consumer (`vllm-probe`) loads the eBPF program, attaches
 it to the kernel tracepoints, drains the ring buffer on a dedicated
