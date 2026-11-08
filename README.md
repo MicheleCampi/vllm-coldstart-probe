@@ -15,6 +15,21 @@ it to the kernel tracepoints, drains the ring buffer on a dedicated
 blocking thread, filters by PID (`--pid 0` keeps every process), and
 streams events as JSONL to stdout or a file.
 
+## Results at a glance
+
+From the captures in the Findings sections below, all on vLLM cold start:
+
+- **The weights do not go through the traced syscalls** (Mistral-7B FP16,
+  A10): the traced `read`s move 0.53 GiB against 13.5 GiB of weights, and
+  one `cuLaunchKernel` out of 947 takes 1.29 s.
+- **Model size** (Qwen2.5 AWQ): on the same A10, 7B to 14B makes the load
+  1.32x longer.
+- **Quantization** (Qwen2.5-7B, A10): AWQ issues 4.1x the kernel launches
+  of FP16, GPTQ 2.4x; GPTQ still loads fastest, 12.32 s against 15.05 s.
+- **Workarounds** (same model, A10): CUDA graphs make the load 3.2x slower
+  (47.72 s against 15.05 s) with 79x the kernel launches; a warm page cache
+  saves 3.35 s.
+
 ## Status
 
 Captures both sides of vLLM cold-start on a real GPU:
